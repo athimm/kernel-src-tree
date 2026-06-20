@@ -1,0 +1,109 @@
+name: CLK Rebase
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types:
+      - stable-branch-updated
+
+permissions:
+  contents: write
+
+jobs:
+  clk-rebase:
+    runs-on: kernel-build
+    container:
+      image: rockylinux:9
+    env:
+      # For repository_dispatch events, use the branch from the payload
+      # For workflow_dispatch, default to stable_6.18.y
+      STABLE_TRACKING_BRANCH: ${{ github.event.client_payload.branch || 'stable_6.18.y' }}
+    steps:
+      - name: Validate branch name
+        run: |
+          # Ensure branch name only contains allowed characters
+          if ! echo "$STABLE_TRACKING_BRANCH" | grep -qE '^stable_[0-9]+\.[0-9]+\.y$'; then
+            echo "ERROR: Invalid STABLE_TRACKING_BRANCH format: $STABLE_TRACKING_BRANCH"
+            echo "Expected format: stable_X.Y.y (e.g., stable_6.18.y)"
+            exit 1
+          fi
+          echo "Branch name validated: $STABLE_TRACKING_BRANCH"
+
+      - name: Generate GitHub App token
+        id: generate-token
+        uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3 # v3.1.1
+        with:
+          client-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          repositories: |
+            kernel-src-tree
+            kernel-src-tree-tools
+
+      - name: Set version variables
+        run: |
+          set -e  # Exit on any error
+          # Extract version from STABLE_TRACKING_BRANCH (e.g., stable_6.12.y -> 6.12.y)
+          STABLE_BASE_VERSION=$(echo "$STABLE_TRACKING_BRANCH" | sed 's/^stable_//')
+          echo "STABLE_BASE_VERSION=$STABLE_BASE_VERSION" >> $GITHUB_ENV
+
+          # Construct branch names from the base version
+          echo "CLK_BRANCH=ciq-$STABLE_BASE_VERSION" >> $GITHUB_ENV
+          echo "CLK_NEXT_BRANCH=ciq-${STABLE_BASE_VERSION}-next" >> $GITHUB_ENV
+          echo "TMP_CLK_NEXT_BRANCH={automation_tmp}_ciq-${STABLE_BASE_VERSION}-next" >> $GITHUB_ENV
+
+      - name: Install system dependencies
+        run: |
+          dnf install epel-release -y
+          dnf install -y git python3-GitPython
+
+      - name: Checkout kernel-src-tree
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          repository: ctrliq/kernel-src-tree
+          token: ${{ steps.generate-token.outputs.token }}
+          path: kernel-src-tree
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Checkout kernel-src-tree-tools
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          repository: ctrliq/kernel-src-tree-tools
+          token: ${{ steps.generate-token.outputs.token }}
+          path: kernel-src-tree-tools
+          persist-credentials: true
+
+      - name: Configure git
+        run: |
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+
+      - name: Perform rebase
+        run: |
+          set -e  # Exit on any error
+          cd kernel-src-tree
+
+          git checkout $STABLE_TRACKING_BRANCH
+          git checkout $CLK_BRANCH
+
+          # Run rebase script and verify it succeeded
+          if ! ../kernel-src-tree-tools/lt_rebase.sh $STABLE_TRACKING_BRANCH; then
+            echo "ERROR: Rebase failed"
+            exit 1
+          fi
+
+          echo "Rebase completed successfully"
+
+      - name: Push branches
+        run: |
+          set -e  # Exit on any error
+          cd kernel-src-tree
+
+          # Clear any cached credentials and configure the token for push
+          git config --unset-all http.https://github.com/.extraheader || true
+          git config --global url."https://x-access-token:${{ steps.generate-token.outputs.token }}@github.com/".insteadOf "https://github.com/"
+
+          # Push base branch first so it exists as a PR target
+          git push origin $CLK_NEXT_BRANCH
+
+          # Push automation branch — this triggers the multiarch build/test pipeline
+          git push origin $TMP_CLK_NEXT_BRANCH
